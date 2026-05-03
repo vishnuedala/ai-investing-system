@@ -3,6 +3,9 @@ OHLCV data fetcher with disk caching.
 
 Downloads daily bars from Yahoo Finance via yfinance and caches them as
 Parquet files so repeated runs don't hit the network.
+
+Compatible with yfinance ≥0.2.x which returns MultiIndex columns for all
+downloads (single and batch alike).
 """
 import logging
 import os
@@ -36,10 +39,9 @@ class DataFetcher:
         force_refresh: bool = False,
     ) -> Dict[str, pd.DataFrame]:
         """
-        Return a dict of {ticker: OHLCV DataFrame} for all tickers.
-
-        DataFrames have columns: Open, High, Low, Close, Volume, Adj_Close.
-        Index is a DatetimeIndex (UTC-naive).
+        Return {ticker: OHLCV DataFrame} for all tickers.
+        Columns are always: Open, High, Low, Close, Volume.
+        Index is a tz-naive DatetimeIndex.
         """
         start = start or self.cfg.start_date
         end = end or self.cfg.end_date
@@ -50,7 +52,6 @@ class DataFetcher:
         for ticker in tickers:
             cached = self._load_cache(ticker)
             if cached is not None and not force_refresh:
-                # Extend cache if end date is beyond what we have
                 cached = self._maybe_extend(cached, ticker, end)
                 df = cached.loc[start:end]
                 if len(df) >= 20:
@@ -68,10 +69,11 @@ class DataFetcher:
                 else:
                     logger.warning("Skipping %s — insufficient data", ticker)
 
-        # Always fetch benchmark
-        spy = self.fetch_single(self.cfg.spy_ticker, start, end)
-        if spy is not None:
-            data[self.cfg.spy_ticker] = spy
+        # Include benchmark (fetch directly to avoid recursion)
+        if self.cfg.spy_ticker not in data:
+            spy = self.fetch_single(self.cfg.spy_ticker, start, end)
+            if spy is not None:
+                data[self.cfg.spy_ticker] = spy
 
         logger.info("Loaded data for %d tickers", len(data))
         return data
@@ -79,11 +81,22 @@ class DataFetcher:
     def fetch_single(
         self, ticker: str, start: Optional[str] = None, end: Optional[str] = None
     ) -> Optional[pd.DataFrame]:
-        """Fetch a single ticker, returning None on failure."""
+        """Fetch one ticker directly (does not trigger the SPY auto-add)."""
         start = start or self.cfg.start_date
         end = end or self.cfg.end_date
-        result = self.fetch([ticker], start, end)
-        return result.get(ticker)
+
+        cached = self._load_cache(ticker)
+        if cached is not None:
+            cached = self._maybe_extend(cached, ticker, end)
+            df = cached.loc[start:end]
+            if len(df) >= 20:
+                return df
+
+        df = self._download_single(ticker, start, end)
+        if df is not None and len(df) >= 20:
+            self._save_cache(ticker, df)
+            return df.loc[start:end]
+        return None
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -113,10 +126,8 @@ class DataFetcher:
     def _maybe_extend(
         self, cached: pd.DataFrame, ticker: str, end: str
     ) -> pd.DataFrame:
-        """Append newer data if the cache is stale."""
         last_date = cached.index[-1]
         end_dt = pd.Timestamp(end)
-        # Leave a 2-day buffer for weekends/holidays
         if last_date >= end_dt - timedelta(days=2):
             return cached
 
@@ -134,6 +145,7 @@ class DataFetcher:
     def _download_single(
         self, ticker: str, start: str, end: str
     ) -> Optional[pd.DataFrame]:
+        """Download one ticker and return a clean flat DataFrame."""
         try:
             raw = yf.download(
                 ticker,
@@ -143,7 +155,11 @@ class DataFetcher:
                 progress=False,
                 threads=False,
             )
-            return self._clean(raw) if not raw.empty else None
+            if raw.empty:
+                return None
+            # yfinance ≥0.2 returns MultiIndex (Price, Ticker) for single downloads
+            flat = self._flatten(raw, ticker)
+            return self._clean(flat)
         except Exception as exc:
             logger.warning("Download failed for %s: %s", ticker, exc)
             return None
@@ -151,11 +167,9 @@ class DataFetcher:
     def _download_batch(
         self, tickers: List[str], start: str, end: str
     ) -> Dict[str, Optional[pd.DataFrame]]:
-        """Download multiple tickers in one yfinance call."""
+        """Download multiple tickers in one call, return flat per-ticker DataFrames."""
         result: Dict[str, Optional[pd.DataFrame]] = {}
 
-        # yfinance handles batches but returns a MultiIndex DataFrame
-        # We process in chunks of 50 to avoid timeout issues
         chunk_size = 50
         for i in range(0, len(tickers), chunk_size):
             chunk = tickers[i : i + chunk_size]
@@ -171,42 +185,66 @@ class DataFetcher:
                 )
             except Exception as exc:
                 logger.warning("Batch download failed: %s", exc)
-                for t in chunk:
-                    result[t] = self._download_single(t, start, end)
+                for ticker in chunk:
+                    result[ticker] = self._download_single(ticker, start, end)
                 continue
 
             for ticker in chunk:
                 try:
-                    if len(chunk) == 1:
-                        df = raw
-                    else:
-                        df = raw[ticker] if ticker in raw.columns.get_level_values(0) else None
-                    if df is not None and not df.empty:
-                        result[ticker] = self._clean(df)
-                    else:
-                        result[ticker] = None
+                    flat = self._flatten(raw, ticker)
+                    result[ticker] = self._clean(flat) if flat is not None and not flat.empty else None
                 except Exception as exc:
-                    logger.debug("Extract failed for %s: %s", ticker, exc)
-                    result[ticker] = self._download_single(t, start, end)
+                    logger.debug("Extract failed for %s: %s — retrying single", ticker, exc)
+                    result[ticker] = self._download_single(ticker, start, end)
 
         return result
 
     @staticmethod
-    def _clean(df: pd.DataFrame) -> pd.DataFrame:
-        """Standardise column names and drop rows with missing OHLCV."""
-        df = df.copy()
-        df.columns = [c.strip().title().replace(" ", "_") for c in df.columns]
-        # Rename common yfinance column variants
-        rename = {
-            "Adj_Close": "Adj_Close",
-            "Adj Close": "Adj_Close",
-            "Close": "Close",
-        }
-        df.rename(columns=rename, inplace=True)
+    def _flatten(raw: pd.DataFrame, ticker: str) -> Optional[pd.DataFrame]:
+        """
+        Extract a flat (non-MultiIndex) OHLCV DataFrame for one ticker.
 
-        # Ensure we have the standard columns
+        yfinance ≥0.2.x column layouts we handle:
+          Single-ticker:  MultiIndex (Price, Ticker)  e.g. ('Close', 'AAPL')
+          Multi-ticker:   MultiIndex (Ticker, Price)  e.g. ('AAPL', 'Close')
+          Legacy:         flat strings                e.g. 'Close'
+        """
+        if not isinstance(raw.columns, pd.MultiIndex):
+            # Already flat — legacy yfinance or single already extracted
+            return raw
+
+        level0_vals = raw.columns.get_level_values(0).unique().tolist()
+        level1_vals = raw.columns.get_level_values(1).unique().tolist()
+
+        # Multi-ticker layout: level 0 = Ticker, level 1 = Price field
+        if ticker in level0_vals:
+            return raw[ticker].copy()
+
+        # Single-ticker layout: level 0 = Price field, level 1 = Ticker
+        if ticker in level1_vals:
+            df = raw.xs(ticker, axis=1, level=1).copy()
+            return df
+
+        logger.warning("Ticker %s not found in columns %s", ticker, raw.columns.tolist()[:6])
+        return None
+
+    @staticmethod
+    def _clean(df: pd.DataFrame) -> pd.DataFrame:
+        """Normalise column names and drop rows with missing Close."""
+        df = df.copy()
+
+        # If somehow still MultiIndex, flatten to strings
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = ["_".join(str(p) for p in col if p).strip() for col in df.columns]
+
+        df.columns = [str(c).strip().title().replace(" ", "_") for c in df.columns]
+
         required = ["Open", "High", "Low", "Close", "Volume"]
-        df = df[[c for c in required if c in df.columns]]
+        available = [c for c in required if c in df.columns]
+        if not available or "Close" not in available:
+            raise ValueError(f"Missing required columns. Got: {df.columns.tolist()}")
+
+        df = df[available]
         df.dropna(subset=["Close"], inplace=True)
         df.index = pd.to_datetime(df.index).tz_localize(None)
         df.sort_index(inplace=True)
