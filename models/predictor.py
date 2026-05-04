@@ -52,7 +52,8 @@ class Predictor:
             row = features[ticker].reindex(self._feature_names).fillna(0.0)
             rows.append(row.values)
 
-        X = np.array(rows)
+        # Pass as DataFrame with named columns to silence sklearn feature-name warning
+        X = pd.DataFrame(rows, columns=self._feature_names)
         probas = self.trainer.model.predict_proba(X)[:, 1]
 
         result = {t: float(p) for t, p in zip(tickers, probas)}
