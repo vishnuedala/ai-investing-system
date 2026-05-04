@@ -1,12 +1,17 @@
 """Central configuration for the AI investing system."""
 from dataclasses import dataclass, field
+from datetime import date
 from typing import List
+
+
+def _today() -> str:
+    return date.today().strftime("%Y-%m-%d")
 
 
 @dataclass
 class DataConfig:
     start_date: str = "2015-01-01"
-    end_date: str = "2025-01-01"
+    end_date: str = field(default_factory=_today)  # always fetch up to today
     cache_dir: str = "data/cache"
     spy_ticker: str = "SPY"
     min_avg_volume: int = 500_000
@@ -79,7 +84,7 @@ class BacktestConfig:
     commission_pct: float = 0.001       # 0.1% per side
     slippage_pct: float = 0.0005        # 0.05% per side
     start_date: str = "2019-01-01"
-    end_date: str = "2024-12-31"
+    end_date: str = field(default_factory=_today)
     benchmark: str = "SPY"
 
 
