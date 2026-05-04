@@ -248,14 +248,14 @@ def cmd_signals(args) -> None:
 
     predictor = Predictor(trainer)
 
-    # Features + predictions
-    pipeline = FeaturePipeline(cfg.features)
+    # Load saved pipeline (scaler + feature names from setup)
     try:
-        live_features = pipeline.transform_latest(price_data, spy_df)
-    except RuntimeError:
-        # Pipeline not fitted — rebuild from historical data
-        X_hist, _ = pipeline.fit_transform(price_data, spy_df)
-        live_features = pipeline.transform_latest(price_data, spy_df)
+        pipeline = FeaturePipeline.load(cfg.features)
+    except FileNotFoundError:
+        print("No saved pipeline found. Run: python3.10 main.py setup --universe small")
+        return
+
+    live_features = pipeline.transform_latest(price_data, spy_df)
 
     probabilities = predictor.predict(live_features)
 

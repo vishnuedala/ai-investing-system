@@ -3,6 +3,8 @@ Feature pipeline — assembles per-ticker feature DataFrames into a
 unified training matrix and provides inference-time snapshots.
 """
 import logging
+import os
+import pickle
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -83,6 +85,25 @@ class FeaturePipeline:
         self._fitted = True
         logger.info("Pipeline fitted: %d rows, %d features", len(X_scaled), len(self.feature_names))
         return X_scaled, y
+
+    def save(self, path: str = "models/saved/pipeline.pkl") -> None:
+        """Persist scaler + feature names so run_daily can load them without refitting."""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            pickle.dump({"scaler": self.scaler, "feature_names": self.feature_names}, f)
+        logger.info("Pipeline saved to %s", path)
+
+    @classmethod
+    def load(cls, cfg: FeatureConfig, path: str = "models/saved/pipeline.pkl") -> "FeaturePipeline":
+        """Load a previously saved pipeline."""
+        with open(path, "rb") as f:
+            payload = pickle.load(f)
+        instance = cls(cfg)
+        instance.scaler = payload["scaler"]
+        instance.feature_names = payload["feature_names"]
+        instance._fitted = True
+        logger.info("Pipeline loaded from %s (%d features)", path, len(instance.feature_names))
+        return instance
 
     # ------------------------------------------------------------------
     # Inference path

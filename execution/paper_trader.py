@@ -21,7 +21,7 @@ import pandas as pd
 from config import Config
 from data.fetcher import DataFetcher
 from data.universe import get_universe
-from features.pipeline import FeaturePipeline
+from features.pipeline import FeaturePipeline  # noqa: F401 — used via FeaturePipeline.load()
 from features.regime import MarketRegime
 from models.predictor import Predictor
 from models.trainer import ModelTrainer
@@ -70,6 +70,7 @@ class PaperTrader:
         X, y = self.pipeline.fit_transform(price_data, spy_df)
         metrics = trainer.train(X, y, final_fit=True)
         trainer.save()
+        self.pipeline.save()  # persist scaler + feature names for run_daily
 
         logger.info("Setup complete. CV AUC=%.4f", metrics.get("auc_mean", 0))
         print(f"\nSetup complete. Validation AUC: {metrics.get('auc_mean', 0):.4f}")
@@ -89,8 +90,10 @@ class PaperTrader:
         try:
             trainer = ModelTrainer.load(self.cfg.model)
             predictor = Predictor(trainer)
-        except FileNotFoundError:
-            logger.error("No trained model found. Run setup() first.")
+            self.pipeline = FeaturePipeline.load(self.cfg.features)
+        except FileNotFoundError as e:
+            logger.error("Missing saved files (%s). Run: python3.10 main.py setup", e)
+            print(f"\nERROR: Run setup first:  python3.10 main.py setup --universe small")
             return
 
         # Transform latest features
