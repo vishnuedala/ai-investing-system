@@ -19,7 +19,6 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, average_precision_score
@@ -146,9 +145,6 @@ class ModelTrainer:
         if self.model is None:
             raise RuntimeError("Model not trained yet.")
         estimator = self.model.named_steps.get("clf", self.model)
-        # Unwrap calibration wrapper if present
-        if hasattr(estimator, "calibrated_classifiers_"):
-            estimator = estimator.calibrated_classifiers_[0].estimator
 
         if hasattr(estimator, "feature_importances_"):
             imp = pd.Series(
@@ -192,9 +188,7 @@ class ModelTrainer:
         else:
             raise ValueError(f"Unknown model_type: {mtype}")
 
-        # Isotonic calibration improves probability estimates
-        calibrated = CalibratedClassifierCV(clf, method="isotonic", cv=3)
-        return Pipeline([("clf", calibrated)])
+        return Pipeline([("clf", clf)])
 
     def _walk_forward_splits(
         self, index: pd.DatetimeIndex

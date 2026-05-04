@@ -32,17 +32,18 @@ class FeatureConfig:
 @dataclass
 class ModelConfig:
     # Options: "gradient_boosting", "random_forest", "logistic_regression"
-    model_type: str = "gradient_boosting"
-    # GBM / RF hyperparameters
-    n_estimators: int = 300
-    max_depth: int = 4
-    learning_rate: float = 0.05
+    # random_forest uses all CPU cores (n_jobs=-1) — much faster than gradient_boosting
+    model_type: str = "random_forest"
+    # RF hyperparameters
+    n_estimators: int = 150
+    max_depth: int = 6
+    learning_rate: float = 0.05    # only used by gradient_boosting
     min_samples_leaf: int = 50
-    subsample: float = 0.8
+    subsample: float = 0.8         # only used by gradient_boosting
     # Walk-forward validation
     train_years: int = 3
     val_years: int = 1
-    n_walk_forward_splits: int = 3
+    n_walk_forward_splits: int = 2
     model_dir: str = "models/saved"
 
 
