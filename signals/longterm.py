@@ -1,31 +1,13 @@
 """
-Long-term buy-and-hold signal generator.
-
-Target hold period: 3–6 months (vs 10-day swing signals)
-Strategy: trend-following + insider buying confirmation
-
-Entry criteria (ALL must be true):
-  1. Price above 200-day MA  (long-term uptrend)
-  2. 50-day MA above 200-day MA  (golden cross zone)
-  3. 6-month momentum > 5%  (sustained strength)
-  4. Insider buying signal  (management has skin in the game)
-  5. Relative strength vs SPY positive over 3 months
-
-Exit criteria:
-  - Price crosses below 200-day MA  (trend broken)
-  - Hard stop: −15% from entry
-  - Profit target: +40% from entry
-  - Hold for minimum 60 days before considering exit (avoid overtrading)
-
-Risk:
-  - Max 6 long-term positions
-  - 12–15% per position (larger than swing — higher conviction)
+Long-term buy-and-hold signal generator with live news.
+Target hold: 3–6 months. Entry: trend + momentum + insider confirmation.
 """
 import logging
-from dataclasses import dataclass
+import textwrap
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
-import numpy as np
 import pandas as pd
 
 from data.insider import get_insider_signals_bulk
@@ -36,243 +18,301 @@ logger = logging.getLogger(__name__)
 @dataclass
 class LongTermSignal:
     ticker: str
-    score: float                    # composite 0–100
+    score: float
     close_price: float
     above_200ma: bool
-    golden_cross: bool              # 50MA > 200MA
-    momentum_6m: float              # 6-month price return
+    golden_cross: bool
+    momentum_6m: float
     momentum_3m: float
-    rel_strength_3m: float          # vs SPY
-    insider_score: float            # 0–1 from Form 4 data
+    momentum_1m: float
+    rel_strength_3m: float
+    insider_score: float
     insider_buys: int
+    insider_sells: int
     insider_buy_value: float
-    action: str                     # STRONG_BUY / BUY / WATCH / AVOID
-    reasons: List[str]
-
-    def __str__(self):
-        return (
-            f"{self.ticker:<6}  {self.action:<12}  score={self.score:.0f}/100  "
-            f"6m={self.momentum_6m*100:+.1f}%  "
-            f"insider={'✅' if self.insider_buys > 0 else '—'}"
-        )
+    insider_sell_value: float
+    action: str                 # STRONG_BUY / BUY / WATCH / AVOID
+    stop_loss: float
+    take_profit: float
+    reasons: List[str] = field(default_factory=list)
+    news: List[Dict] = field(default_factory=list)
 
 
 class LongTermAnalyzer:
-    """
-    Scores each stock on a 0–100 composite scale and recommends
-    long-term positions.
-
-    Score components:
-      30 pts — Trend (above 200MA, golden cross)
-      25 pts — Momentum (3m and 6m price return)
-      25 pts — Relative strength vs market
-      20 pts — Insider buying (SEC Form 4)
-    """
+    """Score stocks 0–100 and generate clean, readable reports with live news."""
 
     def __init__(
         self,
         stop_loss_pct: float = 0.15,
         take_profit_pct: float = 0.40,
-        min_hold_days: int = 60,
         fetch_insider: bool = True,
+        fetch_news: bool = True,
     ):
-        self.stop_loss_pct = stop_loss_pct
-        self.take_profit_pct = take_profit_pct
-        self.min_hold_days = min_hold_days
+        self.stop_pct = stop_loss_pct
+        self.tp_pct = take_profit_pct
         self.fetch_insider = fetch_insider
+        self.fetch_news = fetch_news
 
     def analyze(
         self,
         price_data: Dict[str, pd.DataFrame],
         spy_df: Optional[pd.DataFrame] = None,
     ) -> List[LongTermSignal]:
-        """
-        Analyze all tickers and return ranked long-term signals.
-        """
         tickers = [t for t in price_data if t != "SPY" and len(price_data[t]) >= 200]
 
-        # Fetch insider data in bulk (one SEC request per ticker)
+        # Insider data
         insider_data: Dict[str, Dict] = {}
-        if self.fetch_insider and tickers:
-            logger.info("Fetching insider transaction data for %d tickers...", len(tickers))
-            print(f"\n  Fetching SEC Form 4 insider data for {len(tickers)} stocks...")
-            insider_data = get_insider_signals_bulk(tickers, lookback_days=90)
-            logger.info("Insider data fetched.")
+        if self.fetch_insider:
+            print(f"  📋 Fetching SEC Form 4 insider filings ({len(tickers)} stocks)...")
+            insider_data = get_insider_signals_bulk(tickers, lookback_days=180, delay=1.0)
+
+        # News
+        news_data: Dict[str, List] = {}
+        if self.fetch_news:
+            print(f"  📰 Fetching latest news headlines...")
+            news_data = _fetch_news_bulk(tickers)
 
         signals = []
         for ticker in tickers:
-            df = price_data[ticker]
-            spy = spy_df
             try:
-                sig = self._score_ticker(ticker, df, spy, insider_data.get(ticker, {}))
+                sig = self._score(ticker, price_data[ticker], spy_df,
+                                  insider_data.get(ticker, {}),
+                                  news_data.get(ticker, []))
                 signals.append(sig)
-            except Exception as exc:
-                logger.debug("Long-term score failed for %s: %s", ticker, exc)
+            except Exception as e:
+                logger.debug("Score failed %s: %s", ticker, e)
 
-        # Sort by composite score descending
         signals.sort(key=lambda s: s.score, reverse=True)
         return signals
 
-    def print_report(self, signals: List[LongTermSignal], top_n: int = 15) -> None:
-        print(f"\n{'='*75}")
-        print("  LONG-TERM BUY & HOLD ANALYSIS  (3–6 month horizon)")
-        print(f"  Scores: Trend(30) + Momentum(25) + Rel.Strength(25) + Insider(20) = 100")
-        print(f"{'='*75}")
-        print(f"{'Ticker':<7} {'Action':<14} {'Score':>5}  {'6m Ret':>7}  "
-              f"{'3m Ret':>7}  {'vs SPY':>7}  {'Insider':>8}  200MA")
-        print(f"{'-'*75}")
+    def print_report(self, signals: List[LongTermSignal]) -> None:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        buys  = [s for s in signals if s.action in ("STRONG_BUY", "BUY")]
+        watch = [s for s in signals if s.action == "WATCH"]
+        avoid = [s for s in signals if s.action == "AVOID"]
 
-        for s in signals[:top_n]:
-            trend_str = "✅" if s.above_200ma else "❌"
-            insider_str = f"+${s.insider_buy_value/1000:.0f}K" if s.insider_buys > 0 else "  none"
-            print(
-                f"{s.ticker:<7} {s.action:<14} {s.score:>5.0f}  "
-                f"{s.momentum_6m*100:>+7.1f}%  "
-                f"{s.momentum_3m*100:>+7.1f}%  "
-                f"{s.rel_strength_3m*100:>+7.1f}%  "
-                f"{insider_str:>8}  {trend_str}"
-            )
+        print(f"\n{'━'*65}")
+        print(f"  📈  LONG-TERM BUY & HOLD REPORT  —  {now}")
+        print(f"  Strategy: 3–6 month holds  |  Stop −15%  |  Target +40%")
+        print(f"{'━'*65}")
 
-        print(f"{'='*75}")
-        buys = [s for s in signals if s.action in ("STRONG_BUY", "BUY")]
+        # ── BUY section ───────────────────────────────────────────────
         if buys:
-            print(f"\n  TOP PICKS ({len(buys)} stocks):")
-            for s in buys[:5]:
-                print(f"  ★  {s.ticker:<6}  ${s.close_price:.2f}")
-                print(f"     Stop loss:   ${s.close_price * (1 - self.stop_loss_pct):.2f}  (−{self.stop_loss_pct*100:.0f}%)")
-                print(f"     Take profit: ${s.close_price * (1 + self.take_profit_pct):.2f}  (+{self.take_profit_pct*100:.0f}%)")
-                print(f"     Hold target: {self.min_hold_days}–180 days")
-                for r in s.reasons[:3]:
-                    print(f"     → {r}")
-                print()
+            print(f"\n  ✅  BUY CANDIDATES  ({len(buys)} stocks)\n")
+            for s in buys:
+                self._print_card(s)
+        else:
+            print("\n  ⚠️  No strong buy candidates today.\n")
+
+        # ── WATCH section ─────────────────────────────────────────────
+        if watch:
+            print(f"  👀  WATCHING  ({len(watch)} stocks — improving but not ready)\n")
+            for s in watch:
+                trend = "✅ above 200MA" if s.above_200ma else "❌ below 200MA"
+                print(f"     {s.ticker:<6}  ${s.close_price:>8.2f}  "
+                      f"6m {s.momentum_6m*100:>+6.1f}%  {trend}")
+            print()
+
+        # ── AVOID section ─────────────────────────────────────────────
+        if avoid:
+            print(f"  🚫  AVOID  ({len(avoid)} stocks — downtrending)\n")
+            for s in avoid:
+                print(f"     {s.ticker:<6}  ${s.close_price:>8.2f}  "
+                      f"6m {s.momentum_6m*100:>+6.1f}%  "
+                      f"3m {s.momentum_3m*100:>+6.1f}%")
+            print()
+
+        print(f"{'━'*65}")
+        print(f"  Insider data: SEC Form 4 (openinsider.com) — public legal filings")
+        print(f"  News: Yahoo Finance live headlines")
+        print(f"{'━'*65}\n")
 
     # ------------------------------------------------------------------
 
-    def _score_ticker(
-        self,
-        ticker: str,
-        df: pd.DataFrame,
-        spy_df: Optional[pd.DataFrame],
-        insider: Dict,
-    ) -> LongTermSignal:
+    def _print_card(self, s: LongTermSignal) -> None:
+        action_icon = "🔥" if s.action == "STRONG_BUY" else "📈"
+        print(f"  {action_icon}  {s.ticker}  —  ${s.close_price:.2f}  "
+              f"(Score: {s.score:.0f}/100)")
+        print(f"     {'─'*55}")
+
+        # Price targets
+        print(f"     💰 Entry now:   ${s.close_price:.2f}")
+        print(f"     🛑 Stop loss:   ${s.stop_loss:.2f}  (−{self.stop_pct*100:.0f}%  "
+              f"max loss per share: ${s.close_price - s.stop_loss:.2f})")
+        print(f"     🎯 Take profit: ${s.take_profit:.2f}  (+{self.tp_pct*100:.0f}%  "
+              f"potential gain: ${s.take_profit - s.close_price:.2f}/share)")
+
+        # Returns
+        trend_str = "✅ above 200-day MA" if s.above_200ma else "❌ below 200-day MA"
+        gc_str    = "✅ Golden cross" if s.golden_cross else ""
+        print(f"\n     📊 Performance:")
+        print(f"        1-month:  {s.momentum_1m*100:>+6.1f}%")
+        print(f"        3-month:  {s.momentum_3m*100:>+6.1f}%")
+        print(f"        6-month:  {s.momentum_6m*100:>+6.1f}%")
+        print(f"        vs SPY:   {s.rel_strength_3m*100:>+6.1f}% (3m outperformance)")
+        print(f"        Trend:    {trend_str}  {gc_str}")
+
+        # Insider activity
+        print(f"\n     🏢 Insider Activity (last 6 months — SEC Form 4):")
+        if s.insider_buys == 0 and s.insider_sells == 0:
+            print(f"        No open-market transactions filed")
+        else:
+            if s.insider_buys > 0:
+                print(f"        ✅ BUYING:  {s.insider_buys} purchase(s)  "
+                      f"total ${s.insider_buy_value:,.0f}")
+            if s.insider_sells > 0:
+                print(f"        ❌ SELLING: {s.insider_sells} sale(s)  "
+                      f"total ${s.insider_sell_value:,.0f}")
+            net = s.insider_buy_value - s.insider_sell_value
+            if net > 0:
+                print(f"        👍 Net insider buying: +${net:,.0f}")
+            else:
+                print(f"        👎 Net insider selling: −${abs(net):,.0f}")
+
+        # Why we like it
+        if s.reasons:
+            print(f"\n     💡 Why this stock:")
+            for r in s.reasons[:4]:
+                print(f"        → {r}")
+
+        # Live news
+        if s.news:
+            print(f"\n     📰 Latest News:")
+            for item in s.news[:3]:
+                title = item.get("title", "")[:70]
+                age   = item.get("age", "")
+                print(f"        [{age}]  {title}")
+
+        print()
+
+    # ------------------------------------------------------------------
+
+    def _score(self, ticker, df, spy_df, insider, news):
         close = df["Close"]
-        current = float(close.iloc[-1])
+        price = float(close.iloc[-1])
 
-        # --- Trend component (30 pts) ---
-        ma50 = close.rolling(50, min_periods=40).mean().iloc[-1]
+        ma50  = close.rolling(50,  min_periods=40).mean().iloc[-1]
         ma200 = close.rolling(200, min_periods=150).mean().iloc[-1]
-        above_200 = current > ma200
-        golden_cross = ma50 > ma200
+        above_200 = price > ma200
+        golden    = ma50 > ma200
 
+        # Trend score (30)
         trend_score = 0.0
         if above_200:
             trend_score += 18
-            # How far above 200MA?
-            pct_above = (current / ma200 - 1)
-            trend_score += min(8, pct_above * 100)   # up to 8 pts for distance
-        if golden_cross:
+            trend_score += min(8, (price / ma200 - 1) * 100)
+        if golden:
             trend_score += 4
 
-        # --- Momentum component (25 pts) ---
-        periods = {
-            "1m": 21, "3m": 63, "6m": 126, "12m": 252
-        }
-        returns = {}
-        for label, days in periods.items():
-            if len(close) > days:
-                returns[label] = float(close.iloc[-1] / close.iloc[-days] - 1)
-            else:
-                returns[label] = 0.0
-
-        mom_6m = returns["6m"]
-        mom_3m = returns["3m"]
-
+        # Momentum (25)
+        def ret(d):
+            return float(close.iloc[-1] / close.iloc[-d] - 1) if len(close) > d else 0.0
+        m1, m3, m6 = ret(21), ret(63), ret(126)
         mom_score = 0.0
-        # 6-month return (15 pts)
-        if mom_6m > 0.20:   mom_score += 15
-        elif mom_6m > 0.10: mom_score += 10
-        elif mom_6m > 0.05: mom_score += 6
-        elif mom_6m > 0:    mom_score += 2
-        # 3-month return (10 pts)
-        if mom_3m > 0.10:   mom_score += 10
-        elif mom_3m > 0.05: mom_score += 6
-        elif mom_3m > 0:    mom_score += 3
+        mom_score += 15 if m6 > 0.20 else (10 if m6 > 0.10 else (6 if m6 > 0.05 else (2 if m6 > 0 else 0)))
+        mom_score += 10 if m3 > 0.10 else (6 if m3 > 0.05 else (3 if m3 > 0 else 0))
 
-        # --- Relative strength vs SPY (25 pts) ---
-        rel_3m = 0.0
-        rel_score = 0.0
+        # Relative strength (25)
+        rel3 = 0.0
+        rel_score = 12.0
         if spy_df is not None:
-            spy_close = spy_df["Close"].reindex(close.index).ffill()
-            if len(spy_close) > 63:
-                spy_ret_3m = float(spy_close.iloc[-1] / spy_close.iloc[-63] - 1)
-                rel_3m = mom_3m - spy_ret_3m
-                if rel_3m > 0.10:   rel_score = 25
-                elif rel_3m > 0.05: rel_score = 18
-                elif rel_3m > 0:    rel_score = 10
-                elif rel_3m > -0.05: rel_score = 4
-        else:
-            rel_score = 12  # neutral if no benchmark
+            spy = spy_df["Close"].reindex(close.index).ffill()
+            if len(spy) > 63:
+                spy_r3 = float(spy.iloc[-1] / spy.iloc[-63] - 1)
+                rel3 = m3 - spy_r3
+                rel_score = (25 if rel3 > 0.10 else (18 if rel3 > 0.05 else
+                             (10 if rel3 > 0 else (4 if rel3 > -0.05 else 0))))
 
-        # --- Insider buying component (20 pts) ---
-        insider_score_raw = insider.get("signal_score", 0.5)
-        n_buys = insider.get("n_buys", 0)
-        buy_value = insider.get("buy_value", 0.0)
+        # Insider (20)
+        n_buys      = insider.get("n_buys", 0)
+        n_sells     = insider.get("n_sells", 0)
+        buy_val     = insider.get("buy_value", 0.0)
+        sell_val    = insider.get("sell_value", 0.0)
+        ins_score   = (20 if n_buys >= 3 else (14 if n_buys == 2 else
+                       (14 if n_buys == 1 and buy_val > 500_000 else
+                        (8 if n_buys == 1 else (-5 if n_sells > 2 else 0)))))
 
-        insider_score = 0.0
-        if n_buys >= 3:
-            insider_score = 20                        # multiple insiders buying = strong
-        elif n_buys == 2:
-            insider_score = 14
-        elif n_buys == 1:
-            insider_score = 8
-            if buy_value > 500_000:
-                insider_score = 14                    # large single purchase = more weight
-        elif insider.get("n_sells", 0) > 2:
-            insider_score = -5                        # heavy selling is a warning
+        total = max(0.0, min(100.0, trend_score + mom_score + rel_score + ins_score))
 
-        # --- Composite ---
-        total_score = trend_score + mom_score + rel_score + insider_score
-        total_score = max(0.0, min(100.0, total_score))
+        action = ("STRONG_BUY" if total >= 70 and above_200 else
+                  "BUY"        if total >= 55 and above_200 else
+                  "WATCH"      if total >= 35 else "AVOID")
 
-        # --- Action label ---
-        if total_score >= 70 and above_200:
-            action = "STRONG_BUY"
-        elif total_score >= 55 and above_200:
-            action = "BUY"
-        elif total_score >= 40:
-            action = "WATCH"
-        else:
-            action = "AVOID"
-
-        # --- Build reasoning ---
+        # Build reasons
         reasons = []
-        if above_200:
-            reasons.append(f"Price {(current/ma200-1)*100:+.1f}% above 200-day MA")
-        else:
-            reasons.append(f"Price {(current/ma200-1)*100:+.1f}% BELOW 200-day MA")
-        if golden_cross:
-            reasons.append("Golden cross: 50MA above 200MA ✅")
-        if mom_6m > 0.05:
-            reasons.append(f"Strong 6-month momentum: +{mom_6m*100:.1f}%")
-        if rel_3m > 0.03:
-            reasons.append(f"Outperforming SPY by {rel_3m*100:+.1f}% over 3 months")
-        if n_buys > 0:
-            reasons.append(
-                f"Insider buying: {n_buys} purchase(s) totalling ${buy_value:,.0f} (SEC Form 4)"
-            )
+        if above_200:  reasons.append(f"Price is {(price/ma200-1)*100:.1f}% above its 200-day average — long-term uptrend intact")
+        if golden:     reasons.append("50-day MA crossed above 200-day MA (golden cross) — bullish momentum shift")
+        if m6 > 0.05:  reasons.append(f"Up {m6*100:.1f}% over the past 6 months — sustained strength")
+        if rel3 > 0.03:reasons.append(f"Outperforming the S&P 500 by {rel3*100:.1f}% over 3 months")
+        if n_buys > 0: reasons.append(f"{n_buys} insider purchase(s) totalling ${buy_val:,.0f} — executives buying own stock")
 
         return LongTermSignal(
-            ticker=ticker,
-            score=total_score,
-            close_price=current,
-            above_200ma=above_200,
-            golden_cross=golden_cross,
-            momentum_6m=mom_6m,
-            momentum_3m=mom_3m,
-            rel_strength_3m=rel_3m,
-            insider_score=insider_score_raw,
-            insider_buys=n_buys,
-            insider_buy_value=buy_value,
+            ticker=ticker, score=total, close_price=price,
+            above_200ma=above_200, golden_cross=golden,
+            momentum_6m=m6, momentum_3m=m3, momentum_1m=m1,
+            rel_strength_3m=rel3,
+            insider_score=float(insider.get("signal_score", 0.5)),
+            insider_buys=n_buys, insider_sells=n_sells,
+            insider_buy_value=buy_val, insider_sell_value=sell_val,
             action=action,
-            reasons=reasons,
+            stop_loss=round(price * (1 - self.stop_pct), 2),
+            take_profit=round(price * (1 + self.tp_pct), 2),
+            reasons=reasons, news=news,
         )
+
+
+# ------------------------------------------------------------------
+# News fetcher (Yahoo Finance via yfinance — free, no API key)
+# ------------------------------------------------------------------
+
+def _fetch_news_bulk(tickers: List[str]) -> Dict[str, List]:
+    """Fetch the 3 most recent headlines per ticker using yfinance."""
+    import yfinance as yf
+    result = {}
+    for ticker in tickers:
+        try:
+            raw_news = yf.Ticker(ticker).news or []
+            items = []
+            for n in raw_news[:4]:
+                # yfinance ≥0.2.50 nests everything under 'content'
+                content = n.get("content", n)
+                title     = content.get("title", n.get("title", ""))
+                pub_str   = content.get("pubDate", "")
+                publisher = (content.get("provider", {}) or {}).get("displayName",
+                             n.get("publisher", ""))
+                # Parse ISO date or unix timestamp
+                if pub_str:
+                    try:
+                        pub_dt = datetime.fromisoformat(pub_str.replace("Z", "+00:00"))
+                        age = _age_str(int(pub_dt.timestamp()))
+                    except Exception:
+                        age = pub_str[:10]
+                else:
+                    age = _age_str(int(n.get("providerPublishTime", 0)))
+
+                if title:
+                    items.append({
+                        "title":     title,
+                        "publisher": publisher,
+                        "age":       age,
+                    })
+            result[ticker] = items[:3]
+        except Exception:
+            result[ticker] = []
+    return result
+
+
+def _age_str(unix_ts: int) -> str:
+    """Convert Unix timestamp to human-readable age string."""
+    if not unix_ts:
+        return "?"
+    dt = datetime.fromtimestamp(unix_ts)
+    diff = datetime.now() - dt
+    if diff.days == 0:
+        hours = diff.seconds // 3600
+        return f"{hours}h ago" if hours > 0 else "just now"
+    if diff.days == 1:
+        return "yesterday"
+    if diff.days < 7:
+        return f"{diff.days}d ago"
+    return dt.strftime("%b %d")

@@ -331,15 +331,16 @@ def cmd_longterm(args) -> None:
     spy_df = price_data.get(cfg.data.spy_ticker)
 
     no_insider = getattr(args, "no_insider", False)
+    no_news    = getattr(args, "no_news", False)
     analyzer = LongTermAnalyzer(
         stop_loss_pct=0.15,
         take_profit_pct=0.40,
-        min_hold_days=60,
         fetch_insider=not no_insider,
+        fetch_news=not no_news,
     )
 
     signals = analyzer.analyze(price_data, spy_df)
-    analyzer.print_report(signals, top_n=20)
+    analyzer.print_report(signals)
 
     # Save CSV
     os.makedirs("logs", exist_ok=True)
@@ -451,7 +452,9 @@ def main():
     p_lt = sub.add_parser("longterm", help="Long-term buy & hold analysis with insider data")
     add_common(p_lt)
     p_lt.add_argument("--no-insider", action="store_true",
-                      help="Skip SEC insider data fetch (faster, offline)")
+                      help="Skip SEC insider data fetch (faster)")
+    p_lt.add_argument("--no-news", action="store_true",
+                      help="Skip news headlines fetch (faster)")
 
     p_ins = sub.add_parser("insider", help="Show SEC Form 4 insider transactions for a stock")
     p_ins.add_argument("--ticker", required=True,
