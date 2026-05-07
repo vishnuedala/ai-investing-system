@@ -300,9 +300,69 @@ def cmd_setup(args) -> None:
     trader = PaperTrader(cfg)
     trader.setup(universe_size=args.universe)
     print("\nSetup complete. You can now run:")
-    print("  python main.py paper      # daily paper trading")
-    print("  python main.py signals    # view today's signals")
-    print("  python main.py backtest   # run historical backtest")
+    print("  python3.10 main.py paper      # daily swing paper trading")
+    print("  python3.10 main.py signals    # view today's swing signals")
+    print("  python3.10 main.py longterm   # long-term buy & hold + insider data")
+    print("  python3.10 main.py backtest   # run historical backtest")
+
+
+def cmd_longterm(args) -> None:
+    """
+    Long-term buy-and-hold analysis with SEC insider data.
+
+    Scores each stock 0–100 across:
+      Trend (30pts) + Momentum (25pts) + Relative Strength (25pts) + Insider Buying (20pts)
+    """
+    from data.fetcher import DataFetcher
+    from data.universe import get_universe
+    from signals.longterm import LongTermAnalyzer
+
+    cfg = get_config()
+
+    print(f"\n{'='*60}")
+    print("  LONG-TERM BUY & HOLD  (3–6 month horizon)")
+    print("  Incorporates SEC Form 4 legal insider transactions")
+    print(f"{'='*60}\n")
+
+    tickers = get_universe(args.universe)
+    fetcher = DataFetcher(cfg.data)
+    print("Downloading price data...")
+    price_data = fetcher.fetch(tickers)
+    spy_df = price_data.get(cfg.data.spy_ticker)
+
+    no_insider = getattr(args, "no_insider", False)
+    analyzer = LongTermAnalyzer(
+        stop_loss_pct=0.15,
+        take_profit_pct=0.40,
+        min_hold_days=60,
+        fetch_insider=not no_insider,
+    )
+
+    signals = analyzer.analyze(price_data, spy_df)
+    analyzer.print_report(signals, top_n=20)
+
+    # Save CSV
+    os.makedirs("logs", exist_ok=True)
+    today = pd.Timestamp.now().strftime("%Y-%m-%d")
+    rows = [{
+        "date": today,
+        "ticker": s.ticker,
+        "action": s.action,
+        "score": round(s.score, 1),
+        "close": round(s.close_price, 2),
+        "momentum_6m_pct": round(s.momentum_6m * 100, 2),
+        "momentum_3m_pct": round(s.momentum_3m * 100, 2),
+        "rel_strength_3m_pct": round(s.rel_strength_3m * 100, 2),
+        "above_200ma": s.above_200ma,
+        "golden_cross": s.golden_cross,
+        "insider_buys": s.insider_buys,
+        "insider_buy_value": round(s.insider_buy_value, 0),
+    } for s in signals]
+    csv_path = f"logs/longterm_{today}.csv"
+    pd.DataFrame(rows).to_csv(csv_path, index=False)
+    print(f"\nFull results saved to {csv_path}")
+    print("\nNOTE: Long-term positions use wider stops (−15%) and targets (+40%).")
+    print("      Plan to hold for 60–180 days. Check signals monthly, not daily.")
 
 
 # ------------------------------------------------------------------
@@ -343,6 +403,11 @@ def main():
     p_setup = sub.add_parser("setup", help="Full initial setup")
     add_common(p_setup)
 
+    p_lt = sub.add_parser("longterm", help="Long-term buy & hold analysis with insider data")
+    add_common(p_lt)
+    p_lt.add_argument("--no-insider", action="store_true",
+                      help="Skip SEC insider data fetch (faster, offline)")
+
     args = parser.parse_args()
     setup_logging(args.log_level)
 
@@ -352,6 +417,7 @@ def main():
         "signals": cmd_signals,
         "paper": cmd_paper,
         "setup": cmd_setup,
+        "longterm": cmd_longterm,
     }
     dispatch[args.command](args)
 
