@@ -128,18 +128,31 @@ class DataFetcher:
     ) -> pd.DataFrame:
         last_date = cached.index[-1]
         end_dt = pd.Timestamp(end)
-        if last_date >= end_dt - timedelta(days=2):
+
+        # If cache is more than 7 days stale, always try to extend
+        days_stale = (end_dt - last_date).days
+        if days_stale <= 2:
             return cached
 
+        if days_stale > 7:
+            logger.warning(
+                "%s cache is %d days stale (last: %s) — refreshing...",
+                ticker, days_stale, last_date.date()
+            )
+
         new_start = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
-        logger.debug("Extending cache for %s from %s", ticker, new_start)
         ext = self._download_single(ticker, new_start, end)
         if ext is not None and len(ext) > 0:
             combined = pd.concat([cached, ext])
             combined = combined[~combined.index.duplicated(keep="last")]
             combined.sort_index(inplace=True)
             self._save_cache(ticker, combined)
+            logger.info("%s updated: %s → %s", ticker,
+                        last_date.date(), combined.index[-1].date())
             return combined
+
+        logger.warning("%s cache extension failed — still using data up to %s",
+                       ticker, last_date.date())
         return cached
 
     def _download_single(
