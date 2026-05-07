@@ -365,6 +365,51 @@ def cmd_longterm(args) -> None:
     print("      Plan to hold for 60–180 days. Check signals monthly, not daily.")
 
 
+def cmd_insider(args) -> None:
+    """
+    Show detailed SEC Form 4 insider transactions for one or more tickers.
+    Tells you exactly WHO bought, HOW MUCH, and WHEN.
+    """
+    from data.insider import get_insider_signal, print_insider_summary, _get_cik
+
+    tickers = [t.strip().upper() for t in args.ticker.split(",")]
+    days = getattr(args, "days", 180)
+
+    print(f"\n{'='*65}")
+    print(f"  SEC FORM 4 INSIDER TRANSACTIONS  (last {days} days)")
+    print(f"  Source: SEC EDGAR — 100% public, legal information")
+    print(f"{'='*65}")
+    print(f"  What this shows: when executives/directors/directors")
+    print(f"  buy their OWN company stock on the open market.")
+    print(f"  They must report it to the SEC within 2 business days.")
+    print(f"{'='*65}\n")
+
+    for ticker in tickers:
+        print(f"  Looking up {ticker}...")
+
+        # Show the CIK so user can verify on SEC.gov
+        cik = _get_cik(ticker)
+        if cik:
+            print(f"  SEC CIK: {cik}  →  https://www.sec.gov/cgi-bin/browse-edgar?"
+                  f"action=getcompany&CIK={cik}&type=4&dateb=&owner=include&count=40")
+
+        signal = get_insider_signal(ticker, lookback_days=days)
+        print_insider_summary(ticker, signal)
+
+        if signal["n_buys"] == 0 and signal["n_sells"] == 0:
+            print(f"  ℹ No open-market transactions found in last {days} days.")
+            print(f"  This is common — insiders often go months without trading.")
+
+        print()
+
+    print("  KEY:")
+    print("  BUY  = insider purchased stock on open market (bullish signal)")
+    print("  SELL = insider sold stock (not always bearish — could be tax/diversify)")
+    print("  Only 'P' (Purchase) and 'S' (Sale) codes = open market trades")
+    print("  Excludes: option exercises, gifts, automatic plan sales (10b5-1)")
+    print(f"\n  Verify yourself: https://www.sec.gov/cgi-bin/browse-edgar")
+
+
 # ------------------------------------------------------------------
 # CLI
 # ------------------------------------------------------------------
@@ -408,6 +453,12 @@ def main():
     p_lt.add_argument("--no-insider", action="store_true",
                       help="Skip SEC insider data fetch (faster, offline)")
 
+    p_ins = sub.add_parser("insider", help="Show SEC Form 4 insider transactions for a stock")
+    p_ins.add_argument("--ticker", required=True,
+                       help="Ticker(s) to look up, comma-separated e.g. --ticker NVDA,AAPL")
+    p_ins.add_argument("--days", type=int, default=180,
+                       help="How many days back to search (default 180)")
+
     args = parser.parse_args()
     setup_logging(args.log_level)
 
@@ -418,6 +469,7 @@ def main():
         "paper": cmd_paper,
         "setup": cmd_setup,
         "longterm": cmd_longterm,
+        "insider": cmd_insider,
     }
     dispatch[args.command](args)
 
